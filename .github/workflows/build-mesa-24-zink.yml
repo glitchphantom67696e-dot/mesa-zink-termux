@@ -1,0 +1,267 @@
+# .github/workflows/build-mesa-24-zink.yml
+
+name: Build Mesa 24 Zink for Termux
+
+on:
+  workflow_dispatch:
+    inputs:
+      mesa_version:
+        description: 'Mesa version (e.g., 24.3.4, 24.2.8)'
+        required: true
+        default: '24.3.4'
+      target_arch:
+        description: 'Target architecture'
+        required: true
+        default: 'aarch64'
+        type: choice
+        options:
+          - aarch64
+          - arm
+          - i686
+          - x86_64
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    
+    steps:
+      - name: Checkout termux-packages
+        uses: actions/checkout@v4
+        with:
+          repository: termux/termux-packages
+          path: termux-packages
+          fetch-depth: 1
+
+      - name: Backup original mesa build.sh
+        run: |
+          cd termux-packages
+          cp packages/mesa/build.sh packages/mesa/build.sh.backup
+
+      - name: Patch mesa build.sh for Zink-only build
+        run: |
+          cd termux-packages
+          
+          # 1. Hapus patches yang conflict dengan Zink build
+          echo "Removing conflicting patches..."
+          rm -f packages/mesa/0003-fix-for-anon-file.patch
+          rm -f packages/mesa/0007-use-mtx_t-operations-in-turnip.patch
+          rm -f packages/mesa/0011-freedreno-drm-kgsl-Add-KGSL-backend-for-freedreno.patch
+          rm -f packages/mesa/0012-freedreno-drm-Add-more-APIs-to-per-backend-API.patch
+          rm -f packages/mesa/0015-termux-x11-kgsl.patch
+          rm -f packages/mesa/0016-unofficial_support_adreno_710_720_722.patch
+          rm -f packages/mesa/0017-preserve-egl-support-in-zink.patch
+          rm -f packages/mesa/0018-disable-general-layout-in-zink-for-turnip.patch
+          rm -f packages/mesa/0019-UBWC_5-and-UBWC_6-support.patch
+          rm -f packages/mesa/0020-unofficial-support-adreno-830.patch
+          rm -f packages/mesa/0021-unofficial-support-adreno-810-825-829.patch
+          rm -f packages/mesa/0022-fix-zink-egl.patch
+          rm -f packages/mesa/0023-fix-zink-gles.patch
+          
+          # 2. Override source URL ke Mesa official
+          MESA_VER="${{ github.event.inputs.mesa_version }}"
+          TAR_URL="https://archive.mesa3d.org/mesa-${MESA_VER}.tar.xz"
+          
+          echo "Downloading Mesa ${MESA_VER} to calculate SHA256..."
+          wget -q "$TAR_URL" -O mesa.tar.xz
+          SHA256=$(sha256sum mesa.tar.xz | awk '{print $1}')
+          
+          echo "Patching build.sh..."
+          sed -i "s|^TERMUX_PKG_VERSION=.*|TERMUX_PKG_VERSION=${MESA_VER}|g" packages/mesa/build.sh
+          sed -i "s|^TERMUX_PKG_SRCURL=.*|TERMUX_PKG_SRCURL=${TAR_URL}|g" packages/mesa/build.sh
+          sed -i "s|^TERMUX_PKG_SHA256=.*|TERMUX_PKG_SHA256=${SHA256}|g" packages/mesa/build.sh
+          
+          # 3. Override foldername (Mesa official extract ke mesa-24.3.4)
+          FOLDER_NAME="mesa-${MESA_VER}"
+          sed -i "/^TERMUX_PKG_SHA256=/a TERMUX_PKG_FOLDERNAME=${FOLDER_NAME}" packages/mesa/build.sh
+
+      - name: Inject Zink build configuration & patches
+        run: |
+          cd termux-packages/packages/mesa
+          
+          # Hapus termux_step_post_get_source yang lama jika ada
+          sed -i '/termux_step_post_get_source/,/^}/d' build.sh
+          
+          cat >> build.sh <<'EOF'
+          
+          termux_step_post_get_source() {
+              echo "=== Applying Zink build patches ==="
+              
+              # --- FIX 1: os.link error (Android no hard links) ---
+              if [ -f "bin/install_megadrivers.py" ]; then
+                  echo "Fixing install_megadrivers.py..."
+                  sed -i 's/import os/import os\nimport shutil\n\ndef link(src, dest):\n    shutil.copyfile(src, dest)\n\ndef unlink(src):\n    os.remove(src)\n\nos.link = link\nos.unlink = unlink\n/' bin/install_megadrivers.py
+              fi
+              
+              # --- FIX 2: EGL display header missing Xlib ---
+              if [ -f "src/egl/main/egldisplay.h" ]; then
+                  echo "Fixing egldisplay.h..."
+                  sed -i 's/#include "eglarray.h"/#include "eglarray.h"\n#include <X11\/Xlib.h>/' src/egl/main/egldisplay.h
+              fi
+              
+              # --- FIX 3: memfd_create for Android Bionic ---
+              if [ -f "src/util/anon_file.c" ]; then
+                  echo "Fixing anon_file.c..."
+                  sed -i 's/fd = memfd_create/fd = syscall(SYS_memfd_create, debug_name, MFD_CLOEXEC | MFD_ALLOW_SEALING);\n   if (fd >= 0) return fd;\n   fd = memfd_create/' src/util/anon_file.c
+              fi
+              
+              # --- FIX 4: anon_file path untuk Termux ---
+              if [ -f "src/util/anon_file.c" ]; then
+                  echo "Fixing anon_file paths..."
+                  sed -i 's|"/tmp/|"$PREFIX/tmp/|g' src/util/anon_file.c
+              fi
+              
+              # --- FIX 5: epoll header missing ---
+              if [ -f "src/util/os_file.c" ]; then
+                  echo "Fixing os_file.c..."
+                  sed -i '1i #include <sys/epoll.h>' src/util/os_file.c
+              fi
+              
+              # --- FIX 6: mtx_t operations (pthread -> mtx) ---
+              if [ -f "src/freedreno/vulkan/tu_shader.cc" ]; then
+                  echo "Fixing mtx_t in tu_shader.cc..."
+                  sed -i 's/pthread_mutex_lock(&dev->pipeline_mutex)/mtx_lock(\&dev->pipeline_mutex)/g' src/freedreno/vulkan/tu_shader.cc
+                  sed -i 's/pthread_mutex_unlock(&dev->pipeline_mutex)/mtx_unlock(\&dev->pipeline_mutex)/g' src/freedreno/vulkan/tu_shader.cc
+              fi
+              
+              # --- FIX 7: Remove subprojects untuk hemat space ---
+              rm -rf subprojects
+              
+              echo "=== Zink patches applied successfully ==="
+          }
+          
+          termux_step_pre_configure() {
+              export LDFLAGS+=" -landroid-shmem -llog"
+              export CPPFLAGS+=" -D__USE_GNU"
+              
+              # Override meson args untuk Zink-only build
+              TERMUX_PKG_EXTRA_CONFIGURE_ARGS="
+              -Dcpp_rtti=false
+              -Dgbm=disabled
+              -Dopengl=true
+              -Degl=enabled
+              -Degl-native-platform=x11
+              -Dgles1=disabled
+              -Dgles2=enabled
+              -Dglx=xlib
+              -Dllvm=disabled
+              -Dshared-llvm=disabled
+              -Dplatforms=x11
+              -Dgallium-drivers=virgl,zink,swrast
+              -Dvulkan-drivers=
+              -Dglvnd=disabled
+              -Dxmlconfig=disabled
+              -Dgallium-va=disabled
+              -Dgallium-vdpau=disabled
+              -Dgallium-xa=disabled
+              -Dgallium-omx=disabled
+              -Dlibunwind=disabled
+              -Dvalgrind=disabled
+              -Dmicrosoft-clc=disabled
+              -Dbuildtype=release
+              -Dgallium-tests=disabled
+              -Dtools=[]
+              -Dperfetto=disabled
+              -Ddraw-use-llvm=false
+              "
+          }
+          EOF
+
+      - name: Show patched build.sh
+        run: |
+          cd termux-packages/packages/mesa
+          echo "=== Patched build.sh ==="
+          cat build.sh
+
+      - name: Enable ZRAM
+        run: |
+          sudo modprobe zstd 2>/dev/null || true
+          echo zstd | sudo tee /sys/block/zram0/comp_algorithm 2>/dev/null || true
+          echo 16G | sudo tee /sys/block/zram0/disksize 2>/dev/null || true
+          sudo mkswap /dev/zram0 2>/dev/null || true
+          sudo swapon /dev/zram0 2>/dev/null || true
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/share/swift
+          sudo apt-get clean
+          docker system prune -af 2>/dev/null || true
+
+      - name: Build Mesa Zink package
+        run: |
+          cd termux-packages
+          ./scripts/run-docker.sh ./build-package.sh \
+            -I \
+            -f \
+            -C \
+            -a "${{ github.event.inputs.target_arch }}" \
+            mesa
+
+      - name: Collect build artifacts
+        if: always()
+        run: |
+          mkdir -p artifacts
+          find termux-packages/output -name "*.deb" -type f -exec cp {} artifacts/ \; 2>/dev/null || true
+          find termux-packages/debs -name "*.deb" -type f -exec cp {} artifacts/ \; 2>/dev/null || true
+          cd artifacts && sha256sum *.deb > checksums.txt 2>/dev/null || true
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mesa-24-zink-${{ github.event.inputs.target_arch }}-${{ github.event.inputs.mesa_version }}
+          path: artifacts/*
+          retention-days: 30
+
+      - name: Create GitHub Release
+        if: github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: mesa-24-zink-${{ github.event.inputs.mesa_version }}-${{ github.run_number }}
+          name: Mesa 24 Zink ${{ github.event.inputs.mesa_version }} for Termux (${{ github.event.inputs.target_arch }})
+          body: |
+            ## Mesa 24 Zink ${{ github.event.inputs.mesa_version }} for Termux
+            
+            **Architecture:** ${{ github.event.inputs.target_arch }}
+            **Build Date:** ${{ github.event.repository.updated_at }}
+            
+            ### Installation
+            ```bash
+            # Download .deb file
+            dpkg -i mesa_*.deb
+            apt --fix-broken install -y
+            ```
+            
+            ### Usage (Zink Hardware Acceleration)
+            ```bash
+            # Setup environment
+            export MESA_NO_ERROR=1
+            export MESA_GL_VERSION_OVERRIDE=4.3COMPAT
+            export MESA_GLES_VERSION_OVERRIDE=3.2
+            export GALLIUM_DRIVER=zink
+            export ZINK_DESCRIPTORS=lazy
+            
+            # Install Vulkan loader
+            pkg install vulkan-loader-android  # atau mesa-vulkan-icd-freedreno
+            
+            # Test
+            glxinfo -B
+            glmark2
+            ```
+            
+            ### Features
+            - ✅ Zink (OpenGL over Vulkan)
+            - ✅ Software fallback (swrast)
+            - ✅ VirGL (virtual GPU)
+            - ✅ EGL + GLES 2.0
+            - ✅ Xlib GLX
+            - ❌ LLVM (disabled untuk ringan)
+            - ❌ DRI3 (tidak support di Android)
+            - ❌ Vulkan drivers native (Zink pakai Android Vulkan loader)
+          files: artifacts/*.deb
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
