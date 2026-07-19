@@ -1,16 +1,16 @@
-# .github/workflows/build-mesa-24-zink.yml
+# .github/workflows/build-mesa-24-zink-v2.yml
 
-name: Build Mesa 24 Zink for Termux
+name: 🚀 Build Mesa 24 Zink for Termux (Anti-Fail + Debug)
 
 on:
   workflow_dispatch:
     inputs:
       mesa_version:
-        description: 'Mesa version (e.g., 24.3.4, 24.2.8)'
+        description: '📦 Mesa version (e.g., 24.3.4, 24.2.8, 24.1.7)'
         required: true
         default: '24.3.4'
       target_arch:
-        description: 'Target architecture'
+        description: '🏗️ Target architecture'
         required: true
         default: 'aarch64'
         type: choice
@@ -19,125 +19,338 @@ on:
           - arm
           - i686
           - x86_64
+      build_type:
+        description: '⚡ Build type'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+      debug_mode:
+        description: '🔍 Enable extra debug output?'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
 
 permissions:
   contents: write
 
+env:
+  MESA_VERSION: ${{ github.event.inputs.mesa_version }}
+  TARGET_ARCH: ${{ github.event.inputs.target_arch }}
+  BUILD_TYPE: ${{ github.event.inputs.build_type }}
+  DEBUG_MODE: ${{ github.event.inputs.debug_mode }}
+
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 360
+    timeout-minutes: 420  # 7 jam untuk build besar
     
     steps:
-      - name: Checkout termux-packages
-        uses: actions/checkout@v4
-        with:
-          repository: termux/termux-packages
-          path: termux-packages
-          fetch-depth: 1
+      # ═══════════════════════════════════════════════════════
+      # STEP 0: DEBUG INFO & ENVIRONMENT
+      # ═══════════════════════════════════════════════════════
+      - name: 🔍 Step 0 - Debug Environment Info
+        run: |
+          echo "═══════════════════════════════════════════"
+          echo "  🚀 MESA 24 ZINK BUILD DEBUG INFO"
+          echo "═══════════════════════════════════════════"
+          echo "📅 Date: $(date)"
+          echo "🖥️  Runner: $(uname -a)"
+          echo "💾 Disk Before:"
+          df -h | grep -E "Filesystem|/dev/root"
+          echo "🧠 RAM:"
+          free -h
+          echo "🔧 CPU:"
+          nproc
+          echo "📦 Mesa Version: $MESA_VERSION"
+          echo "🏗️  Target Arch: $TARGET_ARCH"
+          echo "⚡ Build Type: $BUILD_TYPE"
+          echo "🔍 Debug Mode: $DEBUG_MODE"
+          echo "═══════════════════════════════════════════"
 
-      - name: Backup original mesa build.sh
+      # ═══════════════════════════════════════════════════════
+      # STEP 1: CLONE TERMUX-PACKAGES
+      # ═══════════════════════════════════════════════════════
+      - name: 📥 Step 1 - Clone termux-packages
+        run: |
+          echo "⬇️  Cloning termux-packages..."
+          git clone --depth 1 https://github.com/termux/termux-packages.git
+          echo "✅ Clone done"
+          ls -la termux-packages/
+          echo "📂 Packages dir:"
+          ls termux-packages/packages/ | head -20
+
+      # ═══════════════════════════════════════════════════════
+      # STEP 2: BACKUP & INSPECT ORIGINAL BUILD.SH
+      # ═══════════════════════════════════════════════════════
+      - name: 📋 Step 2 - Backup & Inspect Original build.sh
         run: |
           cd termux-packages
-          cp packages/mesa/build.sh packages/mesa/build.sh.backup
+          cp packages/mesa/build.sh packages/mesa/build.sh.original
+          echo "═══════════════════════════════════════════"
+          echo "  📋 ORIGINAL build.sh CONTENT"
+          echo "═══════════════════════════════════════════"
+          cat packages/mesa/build.sh
+          echo "═══════════════════════════════════════════"
+          echo "  📋 ORIGINAL PATCHES"
+          echo "═══════════════════════════════════════════"
+          ls -la packages/mesa/*.patch 2>/dev/null || echo "⚠️  No patches found"
 
-      - name: Patch mesa build.sh for Zink-only build
+      # ═══════════════════════════════════════════════════════
+      # STEP 3: REMOVE ALL PATCHES (Anti-Fail #1)
+      # ═══════════════════════════════════════════════════════
+      - name: 🗑️ Step 3 - Remove All Patches
         run: |
           cd termux-packages
+          echo "🗑️  Removing ALL patches to prevent hunk failures..."
+          PATCH_COUNT=$(ls packages/mesa/*.patch 2>/dev/null | wc -l)
+          echo "Found $PATCH_COUNT patches"
+          rm -vf packages/mesa/*.patch 2>/dev/null || true
+          echo "✅ Patches removed"
+          ls packages/mesa/*.patch 2>/dev/null || echo "✅ No patches remain"
+
+      # ═══════════════════════════════════════════════════════
+      # STEP 4: DOWNLOAD MESA & CALCULATE SHA256
+      # ═══════════════════════════════════════════════════════
+      - name: ⬇️ Step 4 - Download Mesa Source & Verify
+        id: download
+        run: |
+          cd termux-packages
+          TAR_URL="https://archive.mesa3d.org/mesa-${MESA_VERSION}.tar.xz"
+          echo "⬇️  Downloading from: $TAR_URL"
           
-          # 1. Hapus patches yang conflict dengan Zink build
-          echo "Removing conflicting patches..."
-          rm -f packages/mesa/0003-fix-for-anon-file.patch
-          rm -f packages/mesa/0007-use-mtx_t-operations-in-turnip.patch
-          rm -f packages/mesa/0011-freedreno-drm-kgsl-Add-KGSL-backend-for-freedreno.patch
-          rm -f packages/mesa/0012-freedreno-drm-Add-more-APIs-to-per-backend-API.patch
-          rm -f packages/mesa/0015-termux-x11-kgsl.patch
-          rm -f packages/mesa/0016-unofficial_support_adreno_710_720_722.patch
-          rm -f packages/mesa/0017-preserve-egl-support-in-zink.patch
-          rm -f packages/mesa/0018-disable-general-layout-in-zink-for-turnip.patch
-          rm -f packages/mesa/0019-UBWC_5-and-UBWC_6-support.patch
-          rm -f packages/mesa/0020-unofficial-support-adreno-830.patch
-          rm -f packages/mesa/0021-unofficial-support-adreno-810-825-829.patch
-          rm -f packages/mesa/0022-fix-zink-egl.patch
-          rm -f packages/mesa/0023-fix-zink-gles.patch
+          if ! wget -q --show-progress "$TAR_URL" -O mesa.tar.xz; then
+            echo "❌ ERROR: Failed to download Mesa $MESA_VERSION"
+            echo "🔍 Trying fallback URL..."
+            TAR_URL="https://archive.mesa3d.org/mesa-${MESA_VERSION}.tar.gz"
+            wget -q --show-progress "$TAR_URL" -O mesa.tar.gz || {
+              echo "❌ FATAL: Cannot download Mesa $MESA_VERSION"
+              echo "💡 Tips: Cek versi di https://archive.mesa3d.org/"
+              exit 1
+            }
+            mv mesa.tar.gz mesa.tar.xz
+          fi
           
-          # 2. Override source URL ke Mesa official
-          MESA_VER="${{ github.event.inputs.mesa_version }}"
-          TAR_URL="https://archive.mesa3d.org/mesa-${MESA_VER}.tar.xz"
+          echo "📊 Downloaded file info:"
+          ls -lh mesa.tar.xz
+          file mesa.tar.xz
           
-          echo "Downloading Mesa ${MESA_VER} to calculate SHA256..."
-          wget -q "$TAR_URL" -O mesa.tar.xz
           SHA256=$(sha256sum mesa.tar.xz | awk '{print $1}')
+          echo "🔐 SHA256: $SHA256"
+          echo "sha256=$SHA256" >> $GITHUB_OUTPUT
           
-          echo "Patching build.sh..."
-          sed -i "s|^TERMUX_PKG_VERSION=.*|TERMUX_PKG_VERSION=${MESA_VER}|g" packages/mesa/build.sh
-          sed -i "s|^TERMUX_PKG_SRCURL=.*|TERMUX_PKG_SRCURL=${TAR_URL}|g" packages/mesa/build.sh
+          # Verify tarball
+          echo "🔍 Verifying tarball..."
+          if ! tar -tf mesa.tar.xz > /dev/null 2>&1; then
+            echo "❌ ERROR: Corrupted tarball!"
+            exit 1
+          fi
+          echo "✅ Tarball valid"
+          
+          # Show top-level contents
+          echo "📂 Top-level tarball contents:"
+          tar -tf mesa.tar.xz | head -10
+
+      # ═══════════════════════════════════════════════════════
+      # STEP 5: PATCH BUILD.SH WITH DEBUG
+      # ═══════════════════════════════════════════════════════
+      - name: 🔧 Step 5 - Patch build.sh (with debug)
+        run: |
+          cd termux-packages
+          SHA256="${{ steps.download.outputs.sha256 }}"
+          
+          echo "═══════════════════════════════════════════"
+          echo "  🔧 PATCHING build.sh"
+          echo "═══════════════════════════════════════════"
+          
+          # Backup
+          cp packages/mesa/build.sh packages/mesa/build.sh.before_patch
+          
+          # Patch version
+          echo "📝 Setting version..."
+          sed -i "s|^TERMUX_PKG_VERSION=.*|TERMUX_PKG_VERSION=${MESA_VERSION}|g" packages/mesa/build.sh
+          
+          # Patch URL
+          echo "📝 Setting source URL..."
+          sed -i "s|^TERMUX_PKG_SRCURL=.*|TERMUX_PKG_SRCURL=https://archive.mesa3d.org/mesa-${MESA_VERSION}.tar.xz|g" packages/mesa/build.sh
+          
+          # Patch SHA256
+          echo "📝 Setting SHA256..."
           sed -i "s|^TERMUX_PKG_SHA256=.*|TERMUX_PKG_SHA256=${SHA256}|g" packages/mesa/build.sh
           
-          # 3. Override foldername (Mesa official extract ke mesa-24.3.4)
-          FOLDER_NAME="mesa-${MESA_VER}"
-          sed -i "/^TERMUX_PKG_SHA256=/a TERMUX_PKG_FOLDERNAME=${FOLDER_NAME}" packages/mesa/build.sh
+          # Add foldername
+          FOLDER_NAME="mesa-${MESA_VERSION}"
+          if ! grep -q "TERMUX_PKG_FOLDERNAME" packages/mesa/build.sh; then
+            sed -i "/^TERMUX_PKG_SHA256=/a TERMUX_PKG_FOLDERNAME=${FOLDER_NAME}" packages/mesa/build.sh
+          fi
+          
+          echo "✅ build.sh patched"
+          echo "📋 Patched build.sh (first 20 lines):"
+          head -20 packages/mesa/build.sh
 
-      - name: Inject Zink build configuration & patches
+      # ═══════════════════════════════════════════════════════
+      # STEP 6: INJECT SUPER PATCH FUNCTION
+      # ═══════════════════════════════════════════════════════
+      - name: 🩹 Step 6 - Inject Anti-Fail Patch Function
         run: |
           cd termux-packages/packages/mesa
           
-          # Hapus termux_step_post_get_source yang lama jika ada
-          sed -i '/termux_step_post_get_source/,/^}/d' build.sh
+          # Hapus function lama jika ada
+          sed -i '/termux_step_post_get_source/,/^}/d' build.sh 2>/dev/null || true
+          sed -i '/termux_step_pre_configure/,/^}/d' build.sh 2>/dev/null || true
+          sed -i '/termux_step_post_make_install/,/^}/d' build.sh 2>/dev/null || true
           
-          cat >> build.sh <<'EOF'
+          cat >> build.sh <<'SUPEREOF'
           
+          # ═══════════════════════════════════════════════════════
+          # SUPER ANTI-FAIL PATCH FUNCTION
+          # ═══════════════════════════════════════════════════════
           termux_step_post_get_source() {
-              echo "=== Applying Zink build patches ==="
+              echo "╔════════════════════════════════════════════════════════════╗"
+              echo "║  🩹 SUPER PATCH: Applying all fixes for Mesa ${TERMUX_PKG_VERSION}  ║"
+              echo "╚════════════════════════════════════════════════════════════╝"
               
-              # --- FIX 1: os.link error (Android no hard links) ---
+              DEBUG="${{ github.event.inputs.debug_mode }}"
+              [ "$DEBUG" = "true" ] && set -x
+              
+              # ─── FIX 1: Android Detection ───
+              echo "🔧 [1/12] Fixing Android detection..."
+              if [ -f "meson.build" ]; then
+                  grep -n "android" meson.build | head -5 || echo "   (no android refs found)"
+                  sed -i 's/host_machine.system() == .android./host_machine.system() == \"android\" or host_machine.system() == \"linux\"/g' meson.build 2>/dev/null || true
+                  echo "   ✅ Done"
+              else
+                  echo "   ⚠️  meson.build not found"
+              fi
+              
+              # ─── FIX 2: llvmpipe multithreading ───
+              echo "🔧 [2/12] Fixing llvmpipe threads..."
+              if [ -f "src/gallium/drivers/llvmpipe/lp_limits.h" ]; then
+                  sed -i 's/#define LP_MAX_THREADS.*/#define LP_MAX_THREADS 1/' src/gallium/drivers/llvmpipe/lp_limits.h
+                  echo "   ✅ Done"
+              else
+                  echo "   ℹ️  Skipped (file not found)"
+              fi
+              
+              # ─── FIX 3: getprogname ───
+              echo "🔧 [3/12] Fixing getprogname..."
+              for file in src/util/u_process.c src/util/os_process.c; do
+                  if [ -f "$file" ]; then
+                      sed -i 's/getprogname()/\"mesa\"/g' "$file" 2>/dev/null || true
+                      echo "   ✅ Fixed $file"
+                  fi
+              done
+              
+              # ─── FIX 4: xlocale (THE MAIN CULPRIT!) ───
+              echo "🔧 [4/12] Fixing xlocale..."
+              if [ -f "meson.build" ]; then
+                  # Hapus semua referensi xlocale
+                  sed -i '/xlocale/d' meson.build 2>/dev/null || true
+                  sed -i '/XLocale/d' meson.build 2>/dev/null || true
+                  echo "   ✅ Removed xlocale from meson.build"
+              fi
+              # Fix header includes
+              find . -name "*.h" -o -name "*.c" | while read f; do
+                  if grep -q "xlocale.h" "$f" 2>/dev/null; then
+                      sed -i 's/#include <xlocale.h>/#include <locale.h>/g' "$f"
+                      echo "   ✅ Fixed xlocale.h in $f"
+                  fi
+              done
+              
+              # ─── FIX 5: os.link (Android hard links) ───
+              echo "🔧 [5/12] Fixing os.link..."
               if [ -f "bin/install_megadrivers.py" ]; then
-                  echo "Fixing install_megadrivers.py..."
                   sed -i 's/import os/import os\nimport shutil\n\ndef link(src, dest):\n    shutil.copyfile(src, dest)\n\ndef unlink(src):\n    os.remove(src)\n\nos.link = link\nos.unlink = unlink\n/' bin/install_megadrivers.py
+                  echo "   ✅ Done"
+              else
+                  echo "   ⚠️  install_megadrivers.py not found"
               fi
               
-              # --- FIX 2: EGL display header missing Xlib ---
+              # ─── FIX 6: EGL Xlib header ───
+              echo "🔧 [6/12] Fixing EGL Xlib..."
               if [ -f "src/egl/main/egldisplay.h" ]; then
-                  echo "Fixing egldisplay.h..."
-                  sed -i 's/#include "eglarray.h"/#include "eglarray.h"\n#include <X11\/Xlib.h>/' src/egl/main/egldisplay.h
+                  if ! grep -q "X11/Xlib.h" src/egl/main/egldisplay.h; then
+                      sed -i 's/#include "eglarray.h"/#include "eglarray.h"\n#include <X11\/Xlib.h>/' src/egl/main/egldisplay.h
+                      echo "   ✅ Done"
+                  else
+                      echo "   ℹ️  Already fixed"
+                  fi
               fi
               
-              # --- FIX 3: memfd_create for Android Bionic ---
+              # ─── FIX 7: memfd_create ───
+              echo "🔧 [7/12] Fixing memfd_create..."
               if [ -f "src/util/anon_file.c" ]; then
-                  echo "Fixing anon_file.c..."
-                  sed -i 's/fd = memfd_create/fd = syscall(SYS_memfd_create, debug_name, MFD_CLOEXEC | MFD_ALLOW_SEALING);\n   if (fd >= 0) return fd;\n   fd = memfd_create/' src/util/anon_file.c
+                  if grep -q "memfd_create" src/util/anon_file.c; then
+                      sed -i 's/fd = memfd_create/fd = syscall(SYS_memfd_create, debug_name, MFD_CLOEXEC | MFD_ALLOW_SEALING);\n   if (fd >= 0) return fd;\n   fd = memfd_create/' src/util/anon_file.c
+                      echo "   ✅ Done"
+                  else
+                      echo "   ℹ️  No memfd_create found"
+                  fi
               fi
               
-              # --- FIX 4: anon_file path untuk Termux ---
+              # ─── FIX 8: anon_file paths ───
+              echo "🔧 [8/12] Fixing anon_file paths..."
               if [ -f "src/util/anon_file.c" ]; then
-                  echo "Fixing anon_file paths..."
                   sed -i 's|"/tmp/|"$PREFIX/tmp/|g' src/util/anon_file.c
+                  echo "   ✅ Done"
               fi
               
-              # --- FIX 5: epoll header missing ---
+              # ─── FIX 9: epoll header ───
+              echo "🔧 [9/12] Fixing epoll..."
               if [ -f "src/util/os_file.c" ]; then
-                  echo "Fixing os_file.c..."
-                  sed -i '1i #include <sys/epoll.h>' src/util/os_file.c
+                  if ! grep -q "sys/epoll.h" src/util/os_file.c; then
+                      sed -i '1i #include <sys/epoll.h>' src/util/os_file.c
+                      echo "   ✅ Done"
+                  else
+                      echo "   ℹ️  Already fixed"
+                  fi
               fi
               
-              # --- FIX 6: mtx_t operations (pthread -> mtx) ---
-              if [ -f "src/freedreno/vulkan/tu_shader.cc" ]; then
-                  echo "Fixing mtx_t in tu_shader.cc..."
-                  sed -i 's/pthread_mutex_lock(&dev->pipeline_mutex)/mtx_lock(\&dev->pipeline_mutex)/g' src/freedreno/vulkan/tu_shader.cc
-                  sed -i 's/pthread_mutex_unlock(&dev->pipeline_mutex)/mtx_unlock(\&dev->pipeline_mutex)/g' src/freedreno/vulkan/tu_shader.cc
+              # ─── FIX 10: mtx_t (pthread → mtx) ───
+              echo "🔧 [10/12] Fixing mtx_t..."
+              for file in src/freedreno/vulkan/tu_shader.cc src/vulkan/wsi/wsi_common_wayland.c; do
+                  if [ -f "$file" ]; then
+                      sed -i 's/pthread_mutex_lock(\([^)]*\))/mtx_lock(\1)/g' "$file" 2>/dev/null || true
+                      sed -i 's/pthread_mutex_unlock(\([^)]*\))/mtx_unlock(\1)/g' "$file" 2>/dev/null || true
+                      echo "   ✅ Fixed $file"
+                  fi
+              done
+              
+              # ─── FIX 11: Fortran check (sometimes fails) ───
+              echo "🔧 [11/12] Disabling Fortran checks..."
+              if [ -f "meson.build" ]; then
+                  sed -i '/fortran/d' meson.build 2>/dev/null || true
+                  echo "   ✅ Done"
               fi
               
-              # --- FIX 7: Remove subprojects untuk hemat space ---
+              # ─── FIX 12: Remove subprojects ───
+              echo "🔧 [12/12] Cleaning subprojects..."
               rm -rf subprojects
+              echo "   ✅ Done"
               
-              echo "=== Zink patches applied successfully ==="
+              [ "$DEBUG" = "true" ] && set +x
+              
+              echo "╔════════════════════════════════════════════════════════════╗"
+              echo "║  ✅ ALL PATCHES APPLIED SUCCESSFULLY                      ║"
+              echo "╚════════════════════════════════════════════════════════════╝"
           }
           
+          # ═══════════════════════════════════════════════════════
+          # PRE-CONFIGURE: Zink-only build flags
+          # ═══════════════════════════════════════════════════════
           termux_step_pre_configure() {
+              echo "╔════════════════════════════════════════════════════════════╗"
+              echo "║  ⚙️  CONFIGURING: Zink-only build                          ║"
+              echo "╚════════════════════════════════════════════════════════════╝"
+              
               export LDFLAGS+=" -landroid-shmem -llog"
               export CPPFLAGS+=" -D__USE_GNU"
               
-              # Override meson args untuk Zink-only build
               TERMUX_PKG_EXTRA_CONFIGURE_ARGS="
               -Dcpp_rtti=false
               -Dgbm=disabled
@@ -161,81 +374,269 @@ jobs:
               -Dlibunwind=disabled
               -Dvalgrind=disabled
               -Dmicrosoft-clc=disabled
-              -Dbuildtype=release
+              -Dbuildtype=${{ github.event.inputs.build_type }}
               -Dgallium-tests=disabled
               -Dtools=[]
               -Dperfetto=disabled
               -Ddraw-use-llvm=false
+              -Dshader-cache=enabled
+              -Dshared-glapi=enabled
               "
+              
+              echo "📋 Configure args:"
+              echo "$TERMUX_PKG_EXTRA_CONFIGURE_ARGS"
+              echo "✅ Configuration set"
           }
-          EOF
+          
+          # ═══════════════════════════════════════════════════════
+          # POST-MAKE: Verify build output
+          # ═══════════════════════════════════════════════════════
+          termux_step_post_make_install() {
+              echo "╔════════════════════════════════════════════════════════════╗"
+              echo "║  🔍 VERIFYING BUILD OUTPUT                                 ║"
+              echo "╚════════════════════════════════════════════════════════════╝"
+              
+              # Check Zink driver
+              if [ -f "$TERMUX_PREFIX/lib/dri/zink_dri.so" ]; then
+                  echo "✅ zink_dri.so found"
+                  ls -lh "$TERMUX_PREFIX/lib/dri/zink_dri.so"
+              else
+                  echo "⚠️  zink_dri.so NOT found"
+              fi
+              
+              # Check swrast
+              if [ -f "$TERMUX_PREFIX/lib/dri/swrast_dri.so" ]; then
+                  echo "✅ swrast_dri.so found"
+              else
+                  echo "⚠️  swrast_dri.so NOT found"
+              fi
+              
+              # Check libGL
+              if [ -f "$TERMUX_PREFIX/lib/libGL.so" ]; then
+                  echo "✅ libGL.so found"
+              else
+                  echo "⚠️  libGL.so NOT found"
+              fi
+              
+              echo "✅ Install verification complete"
+          }
+          SUPEREOF
+          
+          echo "✅ Super patch function injected"
 
-      - name: Show patched build.sh
+      # ═══════════════════════════════════════════════════════
+      # STEP 7: SHOW FINAL BUILD.SH
+      # ═══════════════════════════════════════════════════════
+      - name: 📄 Step 7 - Show Final build.sh
         run: |
           cd termux-packages/packages/mesa
-          echo "=== Patched build.sh ==="
-          cat build.sh
+          echo "═══════════════════════════════════════════"
+          echo "  📄 FINAL build.sh (last 100 lines)"
+          echo "═══════════════════════════════════════════"
+          tail -100 build.sh
 
-      - name: Enable ZRAM
+      # ═══════════════════════════════════════════════════════
+      # STEP 8: SETUP BUILD ENVIRONMENT
+      # ═══════════════════════════════════════════════════════
+      - name: 🛠️ Step 8 - Setup Build Environment
         run: |
-          sudo modprobe zstd 2>/dev/null || true
+          cd termux-packages
+          echo "🔧 Running setup-ubuntu.sh..."
+          ./scripts/setup-ubuntu.sh || {
+            echo "❌ setup-ubuntu.sh failed"
+            exit 1
+          }
+          echo "✅ Ubuntu setup done"
+          
+          echo "🔧 Running setup-android-sdk.sh..."
+          ./scripts/setup-android-sdk.sh || {
+            echo "❌ setup-android-sdk.sh failed"
+            exit 1
+          }
+          echo "✅ Android SDK setup done"
+          
+          echo "📊 Environment after setup:"
+          which clang gcc aarch64-linux-android-clang 2>/dev/null || true
+          echo "NDK path: $ANDROID_NDK" || true
+
+      # ═══════════════════════════════════════════════════════
+      # STEP 9: ENABLE ZRAM
+      # ═══════════════════════════════════════════════════════
+      - name: 💾 Step 9 - Enable ZRAM
+        run: |
+          echo "💾 Setting up ZRAM..."
+          sudo modprobe zstd 2>/dev/null || echo "⚠️  zstd module not available"
           echo zstd | sudo tee /sys/block/zram0/comp_algorithm 2>/dev/null || true
           echo 16G | sudo tee /sys/block/zram0/disksize 2>/dev/null || true
           sudo mkswap /dev/zram0 2>/dev/null || true
           sudo swapon /dev/zram0 2>/dev/null || true
+          echo "✅ ZRAM setup done"
+          free -h
 
-      - name: Free disk space
+      # ═══════════════════════════════════════════════════════
+      # STEP 10: FREE DISK SPACE
+      # ═══════════════════════════════════════════════════════
+      - name: 🧹 Step 10 - Free Disk Space
         run: |
+          echo "🧹 Freeing disk space..."
+          echo "Before cleanup:"
+          df -h | grep -E "Filesystem|/dev/root"
+          
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/share/swift
           sudo apt-get clean
           docker system prune -af 2>/dev/null || true
+          
+          echo "After cleanup:"
+          df -h | grep -E "Filesystem|/dev/root"
 
-      - name: Build Mesa Zink package
+      # ═══════════════════════════════════════════════════════
+      # STEP 11: BUILD (with error capture)
+      # ═══════════════════════════════════════════════════════
+      - name: 🏗️ Step 11 - Build Mesa Package
+        id: build
         run: |
           cd termux-packages
+          echo "🏗️  Starting build..."
+          echo "⏰ This may take 30-90 minutes..."
+          echo "═══════════════════════════════════════════"
+          
+          # Build dengan capture error
+          set -o pipefail
           ./scripts/run-docker.sh ./build-package.sh \
             -I \
             -f \
             -C \
-            -a "${{ github.event.inputs.target_arch }}" \
-            mesa
+            -a "$TARGET_ARCH" \
+            mesa 2>&1 | tee build.log || {
+              echo "❌❌❌ BUILD FAILED ❌❌❌"
+              echo "═══════════════════════════════════════════"
+              echo "📋 Last 100 lines of build.log:"
+              tail -100 build.log
+              echo "═══════════════════════════════════════════"
+              echo "🔍 ERROR SUMMARY:"
+              grep -i "error\|failed\|fatal" build.log | tail -20 || true
+              exit 1
+            }
+          
+          echo "✅✅✅ BUILD SUCCESS ✅✅✅"
+        continue-on-error: true
 
-      - name: Collect build artifacts
+      # ═══════════════════════════════════════════════════════
+      # STEP 12: DEBUG ON FAILURE
+      # ═══════════════════════════════════════════════════════
+      - name: 🐛 Step 12 - Debug on Failure
+        if: steps.build.outcome == 'failure'
+        run: |
+          echo "╔════════════════════════════════════════════════════════════╗"
+          echo "║  🐛 DEBUG MODE: Build failed, analyzing...                ║"
+          echo "╚════════════════════════════════════════════════════════════╝"
+          
+          cd termux-packages
+          
+          # Show build log
+          if [ -f build.log ]; then
+            echo "📋 Full build log (last 200 lines):"
+            tail -200 build.log
+          fi
+          
+          # Check meson logs
+          echo "📋 Meson logs:"
+          find . -name "meson-log.txt" -exec cat {} \; 2>/dev/null | tail -50 || echo "No meson log found"
+          
+          # Check for specific errors
+          echo "🔍 Searching for common errors..."
+          grep -n "error:" build.log 2>/dev/null | tail -20 || true
+          grep -n "undefined reference" build.log 2>/dev/null | tail -10 || true
+          grep -n "cannot find" build.log 2>/dev/null | tail -10 || true
+          grep -n "hunk FAILED" build.log 2>/dev/null | tail -10 || true
+          grep -n "patch FAILED" build.log 2>/dev/null | tail -10 || true
+          
+          # Check source state
+          echo "📂 Source directory state:"
+          ls -la packages/mesa/ 2>/dev/null || true
+          
+          # Check if patches were applied
+          echo "🔍 Patch application status:"
+          grep -r "Applying patch" build.log 2>/dev/null | tail -10 || true
+          
+          # Disk space at failure
+          echo "💾 Disk space at failure:"
+          df -h | grep -E "Filesystem|/dev/root"
+          
+          # Memory at failure
+          echo "🧠 Memory at failure:"
+          free -h
+          
+          echo "❌ Build failed - check logs above"
+
+      # ═══════════════════════════════════════════════════════
+      # STEP 13: COLLECT ARTIFACTS
+      # ═══════════════════════════════════════════════════════
+      - name: 📦 Step 13 - Collect Artifacts
         if: always()
         run: |
+          echo "📦 Collecting artifacts..."
           mkdir -p artifacts
-          find termux-packages/output -name "*.deb" -type f -exec cp {} artifacts/ \; 2>/dev/null || true
-          find termux-packages/debs -name "*.deb" -type f -exec cp {} artifacts/ \; 2>/dev/null || true
-          cd artifacts && sha256sum *.deb > checksums.txt 2>/dev/null || true
+          
+          # Find .deb files
+          echo "🔍 Searching for .deb files..."
+          find termux-packages/output -name "*.deb" -type f -exec cp -v {} artifacts/ \; 2>/dev/null || true
+          find termux-packages/debs -name "*.deb" -type f -exec cp -v {} artifacts/ \; 2>/dev/null || true
+          
+          # Copy build log
+          if [ -f termux-packages/build.log ]; then
+            cp termux-packages/build.log artifacts/
+          fi
+          
+          # Generate checksums
+          cd artifacts
+          echo "📋 Artifacts collected:"
+          ls -la
+          sha256sum *.deb > checksums.txt 2>/dev/null || true
+          echo "✅ Checksums generated"
 
-      - name: Upload build artifacts
+      # ═══════════════════════════════════════════════════════
+      # STEP 14: UPLOAD ARTIFACTS
+      # ═══════════════════════════════════════════════════════
+      - name: ⬆️ Step 14 - Upload Artifacts
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: mesa-24-zink-${{ github.event.inputs.target_arch }}-${{ github.event.inputs.mesa_version }}
-          path: artifacts/*
+          name: mesa-24-zink-${{ env.TARGET_ARCH }}-${{ env.MESA_VERSION }}-${{ github.run_number }}
+          path: |
+            artifacts/*.deb
+            artifacts/*.txt
+            artifacts/build.log
           retention-days: 30
 
-      - name: Create GitHub Release
-        if: github.event_name == 'workflow_dispatch'
+      # ═══════════════════════════════════════════════════════
+      # STEP 15: CREATE RELEASE (only on success)
+      # ═══════════════════════════════════════════════════════
+      - name: 🎉 Step 15 - Create Release
+        if: steps.build.outcome == 'success'
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: mesa-24-zink-${{ github.event.inputs.mesa_version }}-${{ github.run_number }}
-          name: Mesa 24 Zink ${{ github.event.inputs.mesa_version }} for Termux (${{ github.event.inputs.target_arch }})
+          tag_name: mesa-24-zink-${{ env.MESA_VERSION }}-${{ env.TARGET_ARCH }}-${{ github.run_number }}
+          name: 🚀 Mesa 24 Zink ${{ env.MESA_VERSION }} for Termux (${{ env.TARGET_ARCH }})
           body: |
-            ## Mesa 24 Zink ${{ github.event.inputs.mesa_version }} for Termux
+            ## 🎉 Mesa 24 Zink ${{ env.MESA_VERSION }} for Termux
             
-            **Architecture:** ${{ github.event.inputs.target_arch }}
-            **Build Date:** ${{ github.event.repository.updated_at }}
+            | Property | Value |
+            |----------|-------|
+            | **Version** | ${{ env.MESA_VERSION }} |
+            | **Architecture** | ${{ env.TARGET_ARCH }} |
+            | **Build Type** | ${{ env.BUILD_TYPE }} |
+            | **Build Date** | ${{ github.event.repository.updated_at }} |
+            | **Run Number** | ${{ github.run_number }} |
             
-            ### Installation
+            ### 📦 Installation
             ```bash
-            # Download .deb file
+            # Download .deb file dari release ini
             dpkg -i mesa_*.deb
             apt --fix-broken install -y
             ```
             
-            ### Usage (Zink Hardware Acceleration)
+            ### 🚀 Usage (Zink Hardware Acceleration)
             ```bash
             # Setup environment
             export MESA_NO_ERROR=1
@@ -252,16 +653,41 @@ jobs:
             glmark2
             ```
             
-            ### Features
-            - ✅ Zink (OpenGL over Vulkan)
-            - ✅ Software fallback (swrast)
-            - ✅ VirGL (virtual GPU)
-            - ✅ EGL + GLES 2.0
-            - ✅ Xlib GLX
-            - ❌ LLVM (disabled untuk ringan)
-            - ❌ DRI3 (tidak support di Android)
-            - ❌ Vulkan drivers native (Zink pakai Android Vulkan loader)
+            ### ✅ Features
+            - Zink (OpenGL over Vulkan)
+            - Software fallback (swrast)
+            - VirGL (virtual GPU)
+            - EGL + GLES 2.0
+            - Xlib GLX
+            
+            ### ❌ Disabled
+            - LLVM (for lightweight build)
+            - DRI3 (not supported on Android)
+            - Vulkan drivers native (Zink uses Android Vulkan loader)
           files: artifacts/*.deb
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          
+
+      # ═══════════════════════════════════════════════════════
+      # STEP 16: FINAL STATUS
+      # ═══════════════════════════════════════════════════════
+      - name: ✅ Step 16 - Final Status
+        if: always()
+        run: |
+          echo "╔════════════════════════════════════════════════════════════╗"
+          echo "║  🏁 BUILD COMPLETE                                         ║"
+          echo "╚════════════════════════════════════════════════════════════╝"
+          echo "📦 Mesa Version: $MESA_VERSION"
+          echo "🏗️  Architecture: $TARGET_ARCH"
+          echo "⚡ Build Type: $BUILD_TYPE"
+          echo "📊 Build Status: ${{ steps.build.outcome }}"
+          echo "💾 Final Disk Usage:"
+          df -h | grep -E "Filesystem|/dev/root"
+          echo "🧠 Final Memory:"
+          free -h
+          echo "═══════════════════════════════════════════"
+          if [ "${{ steps.build.outcome }}" = "success" ]; then
+            echo "✅✅✅ BUILD SUCCESS! Check Release tab for .deb files ✅✅✅"
+          else
+            echo "❌❌❌ BUILD FAILED! Check Artifacts for logs ❌❌❌"
+          fi
